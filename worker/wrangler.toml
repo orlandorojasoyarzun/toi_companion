@@ -1,0 +1,16 @@
+name = "toi-companion-proxy"
+main = "src/index.ts"
+compatibility_date = "2024-09-25"
+compatibility_flags = ["nodejs_compat"]
+
+# Non-secret defaults. Override per-environment with `wrangler secret put`.
+[vars]
+OPENAI_BASE_URL = "https://api.openai.com/v1"
+DEFAULT_MODEL = "gpt-4o-mini"
+
+# Secrets (set via `wrangler secret put`):
+#   OPENAI_API_KEY     — your OpenAI API key
+#   TOI_SHARED_SECRET  — 32-byte hex secret the app passes in X-Toi-Companion-Secret
+
+[observability]
+enabled = true

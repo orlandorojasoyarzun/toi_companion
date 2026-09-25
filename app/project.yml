@@ -1,0 +1,74 @@
+name: ToiCompanion
+options:
+  bundleIdPrefix: com.salem
+  deploymentTarget:
+    macOS: "13.0"
+  developmentLanguage: en
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+  groupSortPosition: top
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MACOSX_DEPLOYMENT_TARGET: "13.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    ENABLE_HARDENED_RUNTIME: YES
+    CODE_SIGN_STYLE: Automatic
+    CODE_SIGN_IDENTITY: "-"
+    DEVELOPMENT_TEAM: ""
+    SWIFT_TREAT_WARNINGS_AS_ERRORS: NO
+    GCC_TREAT_WARNINGS_AS_ERRORS: NO
+    OTHER_SWIFT_FLAGS: "-Xfrontend -warn-long-function-bodies=400"
+
+targets:
+  ToiCompanion:
+    type: application
+    platform: macOS
+    deploymentTarget: "13.0"
+    sources:
+      - path: ToiCompanion
+        excludes:
+          - "**/.DS_Store"
+          - "**/Info.plist"
+          - "**/*.entitlements"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.salem.toicompanion
+        PRODUCT_NAME: ToiCompanion
+        INFOPLIST_FILE: ToiCompanion/App/Info.plist
+        CODE_SIGN_ENTITLEMENTS: ToiCompanion/Resources/ToiCompanion.entitlements
+        GENERATE_INFOPLIST_FILE: NO
+        COMBINE_HIDPI_IMAGES: YES
+        ENABLE_PREVIEWS: YES
+        SWIFT_EMIT_LOC_STRINGS: YES
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks"
+
+  ToiCompanionTests:
+    type: bundle.unit-test
+    platform: macOS
+    deploymentTarget: "13.0"
+    sources:
+      - path: Tests
+    dependencies:
+      - target: ToiCompanion
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.salem.toicompanion.tests
+        BUNDLE_LOADER: "$(TEST_HOST)"
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/ToiCompanion.app/Contents/MacOS/ToiCompanion"
+
+schemes:
+  ToiCompanion:
+    build:
+      targets:
+        ToiCompanion: all
+        ToiCompanionTests: [test]
+    test:
+      targets:
+        - ToiCompanionTests
+    run:
+      config: Debug
+    archive:
+      config: Release
