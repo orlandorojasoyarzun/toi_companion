@@ -32,31 +32,6 @@ toi_companion/
 └── worker/        Cloudflare Worker proxy to OpenAI
 ```
 
-## Setup
-
-### Worker
-
-```bash
-cd worker
-npm install
-wrangler login
-wrangler secret put OPENAI_API_KEY        # paste your OpenAI key
-wrangler secret put TOI_SHARED_SECRET     # paste any 32-byte hex secret
-wrangler deploy
-```
-
-Note the deployed Worker URL. You will plug it into the app in Phase 4.
-
-### App
-
-```bash
-brew install xcodegen
-cd app
-xcodegen generate
-xcodebuild -scheme ToiCompanion -configuration Debug build
-open ./build/Debug/ToiCompanion.app
-```
-
 ## Development
 
 - `scripts/bootstrap.sh` — one-shot setup (installs deps, generates xcodeproj).
