@@ -17,6 +17,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var audioCapture: AudioCapture?
     private var speechRecognizer: SpeechRecognizer?
 
+    /// Phase 4: LLM streaming client. Cached — holds the TLS-warm-up
+    /// timer. Cancellation goes through `currentLLMTask`, not this.
+    private let llmClient: LLMClient = OpenAIClient(
+        workerURL: LLMConfig.workerBaseURL,
+        secret: LLMConfig.sharedSecret
+    )
+
+    /// The in-flight LLM stream task, if any. Stored so a re-press or
+    /// a new STT final can cancel the previous stream before starting
+    /// a fresh one — otherwise the old stream keeps writing to the
+    /// sticky note and stomping the new one.
+    private var currentLLMTask: Task<Void, Never>?
+
     /// When did the current push-to-talk session start? Used to report
     /// duration in the sticky note. nil when not in a session.
     private var pttStartTime: Date?
@@ -54,8 +67,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // get clobbered by the auto-hide.
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
             guard !self.hasInteracted else { return }
-            StickyNotePanel.shared.show(initialText: "Ready. Hold Right Shift to talk.")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+            StickyNotePanel.shared.show(initialText: "Greetings from Toi_Companion. Press right Shift▲ and ask me anything.")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) {
                 guard !self.hasInteracted else { return }
                 StickyNotePanel.shared.scheduleHide()
             }
@@ -173,6 +186,77 @@ extension AppDelegate: MenuBarActions {
             }
         }
     }
+
+    /// Phase 4: send a hardcoded prompt to the LLM and stream the
+    /// response into the sticky note. Pure component test — bypasses
+    /// the mic and STT so we can isolate Worker + SSE parser + UI
+    /// streaming without speaking.
+    @MainActor
+    func didRequestTestLLM() {
+        NSLog("toi_companion: Test LLM triggered")
+
+        StickyNotePanel.shared.show(initialText: "asking LLM...")
+
+        // Cancel any previous Test LLM stream (e.g. user double-clicked).
+        currentLLMTask?.cancel()
+        currentLLMTask = Task { @MainActor in
+            await self.runLLMStream(
+                systemPrompt: "Be concise. Respond in the user's language.",
+                userPrompt: "Dime en una frase corta qué hace toi_companion, como si fueras un amigo.",
+                errorPrefix: "llm error"
+            )
+        }
+    }
+
+    /// Phase 7: open the settings window. Singleton inside the
+    /// controller, so a second click just brings the existing window
+    /// forward instead of stacking new ones.
+    @MainActor
+    func didRequestFontSettings() {
+        NSLog("toi_companion: Font Settings triggered")
+        SettingsWindowController.shared.show()
+    }
+
+    /// Shared LLM-stream runner. Sends the messages, paints progress
+    /// to the sticky note, and schedules the hide on completion. Both
+    /// the Test LLM menu and the PTT-release pipeline funnel through
+    /// here so cancellation / error / hide behaviour stays consistent.
+    @MainActor
+    private func runLLMStream(
+        systemPrompt: String,
+        userPrompt: String,
+        errorPrefix: String
+    ) async {
+        let messages = [
+            ChatMessage(role: .system, content: systemPrompt),
+            ChatMessage(role: .user, content: userPrompt),
+        ]
+        do {
+            let final = try await llmClient.stream(
+                messages: messages,
+                model: LLMConfig.defaultModel,
+                maxTokens: LLMConfig.maxOutputTokens
+            ) { accumulated in
+                // Hop to main for the UI. `onProgress` is called from
+                // URLSession's byte stream — not the main thread.
+                Task { @MainActor in
+                    StickyNotePanel.shared.updateText(accumulated)
+                }
+            }
+            NSLog("toi_companion: LLM final (\(final.count) chars)")
+            StickyNotePanel.shared.updateText(final)
+            // Stay until the user clicks — 2 seconds isn't enough to read.
+            StickyNotePanel.shared.stayUntilClick()
+        } catch is CancellationError {
+            // A re-press cancelled us. Don't overwrite the sticky note
+            // — the new pipeline owns it now.
+            NSLog("toi_companion: LLM stream cancelled")
+        } catch {
+            NSLog("toi_companion: LLM error: \(error.localizedDescription)")
+            StickyNotePanel.shared.updateText("\(errorPrefix): \(error.localizedDescription)")
+            StickyNotePanel.shared.stayUntilClick()
+        }
+    }
 }
 
 // MARK: - PushToTalkMonitorDelegate
@@ -187,7 +271,7 @@ extension AppDelegate: PushToTalkMonitorDelegate {
         // Show feedback IMMEDIATELY so the user always sees something
         // happen on press, even while we wait for the OS permission prompt.
         pttStartTime = Date()
-        StickyNotePanel.shared.show(initialText: "Listening...")
+        StickyNotePanel.shared.show(initialText: "Listening ...")
 
         // CRITICAL: wait for mic permission BEFORE touching AVAudioEngine.
         // On macOS the OS mic prompt is async; if we call engine.start()
@@ -201,6 +285,14 @@ extension AppDelegate: PushToTalkMonitorDelegate {
                 StickyNotePanel.shared.scheduleHide()
                 return
             }
+
+            // Detach from any previous recogniser before creating a fresh
+            // one. The old recogniser's failsafe holds a strong self
+            // capture to survive AppDelegate's nil-out — without clearing
+            // the delegate here, a stale `.finalized` synthesised after
+            // the new PTT press would clobber the new session's transcript
+            // and kick off a second LLM stream.
+            speechRecognizer?.delegate = nil
 
             // Create FRESH instances every press. The previous session's
             // AudioCapture.stream is a single-consumer AsyncStream that
@@ -252,11 +344,15 @@ extension AppDelegate: PushToTalkMonitorDelegate {
         // Don't overwrite the live interim transcript with a duration
         // string — the user wants to keep seeing what they said. The
         // final callback (in the .finalized event) will replace the text
-        // with the complete transcript and schedule the hide. This
-        // scheduleHide is a safety net for the case where the final
-        // callback never arrives (e.g. recogniser gives up with no
-        // speech).
-        StickyNotePanel.shared.scheduleHide()
+        // with the complete transcript and hand the panel off to the
+        // LLM stream runner, which owns the panel's lifecycle from here
+        // (stayUntilClick on success/error, scheduleHide on silence).
+        //
+        // No auto-hide here — if we schedule one and the LLM response
+        // takes longer than 2s, the panel disappears before the user can
+        // read it. The STT failsafe (strong self capture + 1.5s synth-
+        // final) ensures `.finalized` always fires, so the silence branch
+        // is the only path that needs an explicit hide.
     }
 }
 
@@ -272,11 +368,33 @@ extension AppDelegate: SpeechRecognizerDelegate {
             StickyNotePanel.shared.updateText(text)
         case .finalized(let text):
             NSLog("toi_companion: STT final: \(text)")
-            StickyNotePanel.shared.updateText(text.isEmpty ? "(silence)" : text)
-            StickyNotePanel.shared.scheduleHide()
+
+            // Silence — nothing to send. Keep the duration safety-net
+            // hide from pushToTalkDidRelease (it's already pending).
+            if text.isEmpty {
+                StickyNotePanel.shared.updateText("(silence)")
+                StickyNotePanel.shared.scheduleHide()
+                return
+            }
+
+            // Phase 4: replace the sticky-note text with the LLM stream.
+            // Cancel any in-flight stream first so two finals back to
+            // back don't fight for the panel.
+            StickyNotePanel.shared.updateText(text)
+            currentLLMTask?.cancel()
+            currentLLMTask = Task { @MainActor in
+                await self.runLLMStream(
+                    systemPrompt: "Be concise. Respond in the user's language.",
+                    userPrompt: text,
+                    errorPrefix: "llm"
+                )
+            }
         case .error(let error):
             NSLog("toi_companion: STT error: \(error.localizedDescription)")
-            StickyNotePanel.shared.updateText("stt: \(error.localizedDescription)")
+            // Empty body, auto-hide. The user tapped Shift briefly (e.g.
+            // to type a capital) and we don't want a click-to-close panel
+            // lingering with no content. The error detail is in the log.
+            StickyNotePanel.shared.updateText("")
             StickyNotePanel.shared.scheduleHide()
         }
     }

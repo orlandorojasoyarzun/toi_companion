@@ -123,9 +123,9 @@ final class SpeechRecognizer {
         self.task = task
 
         // Drain the audio stream and forward each buffer to the request.
-        // The Task body runs on a background executor; `append` and
-        // `endAudio` on `SFSpeechAudioBufferRecognitionRequest` are
-        // thread-safe.
+        // The Task body runs on a background executor; `append` on
+        // `SFSpeechAudioBufferRecognitionRequest` is thread-safe.
+        // We don't call endAudio() here — stop() owns that signal.
         streamTask = Task.detached(priority: .userInitiated) { [weak self] in
             for await buffer in stream {
                 guard let self = self else { return }
@@ -134,9 +134,6 @@ final class SpeechRecognizer {
                 self.request?.append(buffer)
             }
             NSLog("toi_companion: STT stream ended, total buffers=\(self?.bufferCount ?? 0)")
-            // Stream finished (AudioCapture stopped) — signal end of audio
-            // so the recogniser delivers its last `isFinal == true` result.
-            self?.request?.endAudio()
         }
 
         NSLog("toi_companion: STT started")
@@ -154,9 +151,36 @@ final class SpeechRecognizer {
         streamTask = nil
 
         request?.endAudio()
-        // The recognitionTask callback will fire with isFinal == true,
-        // which calls cleanup() and emits the final .finalized event.
-        // We DON'T call task?.cancel() here — we want the final transcript.
+        // task?.finish() is supposed to force the recogniser to deliver
+        // its last callback with isFinal == true (Apple's WWDC 2016
+        // SpeakToMe sample calls all three in stopRecording():
+        //   audioEngine.stop(); request.endAudio(); task.finish()).
+        task?.finish()
+
+        // Failsafe: in practice on macOS 14+ the recogniser occasionally
+        // just hangs after finish() — no final callback ever fires. If
+        // 1.5s pass without cleanup() running, synthesise a final from
+        // the current accumulator state and clean up manually. Better to
+        // ship the user's last interim as the "final" than to leave them
+        // looking at a transcript that never reaches the model.
+        //
+        // Strong self capture (not weak): AppDelegate releases its
+        // reference to this recogniser immediately after stop() returns,
+        // so a weak ref would die before the 1.5s elapses. The strong
+        // ref keeps us alive for the duration of the failsafe; once it
+        // fires we go through cleanup() and we're collectable again.
+        // To prevent a stale `.finalized` from racing with a fresh PTT
+        // press, AppDelegate clears our `delegate` before installing
+        // a new recogniser — see pushToTalkDidPress.
+        Task.detached { [self] in
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            guard self.request != nil else { return }  // cleanup already ran
+            var text = ""
+            self.accumulatorQueue.sync { text = self.accumulator.currentText }
+            NSLog("toi_companion: STT final timeout — synthesising final from accumulator (\"\(text)\")")
+            self.deliver(event: .finalized(text: text))
+            self.cleanup()
+        }
     }
 
     // MARK: - Internal
