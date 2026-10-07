@@ -52,6 +52,29 @@ final class MenuBarController {
         testSTT.target = self
         menu.addItem(testSTT)
 
+        // Phase 4: trigger an end-to-end LLM streaming test with a
+        // hardcoded prompt. Proves Worker + SSE parser + sticky note
+        // streaming before we wire PTT release to it.
+        let testLLM = NSMenuItem(
+            title: "Test LLM",
+            action: #selector(MenuBarController.testLLMTapped),
+            keyEquivalent: ""
+        )
+        testLLM.target = self
+        menu.addItem(testLLM)
+
+        menu.addItem(NSMenuItem.separator())
+
+        // Phase 7: open the settings window. Font + size + line spacing
+        // + theme are configured there, with a live preview.
+        let fontSettings = NSMenuItem(
+            title: "Font Settings…",
+            action: #selector(MenuBarController.fontSettingsTapped),
+            keyEquivalent: ","
+        )
+        fontSettings.target = self
+        menu.addItem(fontSettings)
+
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "About toi_companion", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
@@ -76,6 +99,20 @@ final class MenuBarController {
         }
     }
 
+    @objc private func testLLMTapped() {
+        MainActor.assumeIsolated {
+            logger.info("Test LLM triggered")
+            actions?.didRequestTestLLM()
+        }
+    }
+
+    @objc private func fontSettingsTapped() {
+        MainActor.assumeIsolated {
+            logger.info("Font Settings triggered")
+            actions?.didRequestFontSettings()
+        }
+    }
+
     // MARK: - Public
 
     /// Updates the icon in the menu bar to reflect the current voice state.
@@ -93,4 +130,6 @@ final class MenuBarController {
 protocol MenuBarActions: AnyObject {
     func didRequestTestAudio()
     func didRequestTestSTT()
+    func didRequestTestLLM()
+    func didRequestFontSettings()
 }
