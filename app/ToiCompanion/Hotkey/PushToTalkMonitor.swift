@@ -3,14 +3,15 @@ import CoreGraphics
 import os.log
 
 /// Listens for press/release of a single key (Right Shift dev / Right Option prod)
-/// using a `CGEvent` tap in `.listenOnly` mode. Does NOT require Accessibility
-/// permission because we never consume the events, only observe them.
+/// using a `CGEvent` tap in `.listenOnly` mode.
 ///
 /// Lifecycle:
 ///   - `start()` installs the tap and registers its run loop source.
 ///   - `stop()` tears it down.
-///   - On `tapDisabledByTimeout` / `tapDisabledByUserInput` we re-arm automatically
-///     so the user never has to restart the app.
+///   - On `tapDisabledByTimeout` / `tapDisabledByUserInput` we re-arm by
+///     tearing down AND recreating the tap — a simple `tapEnable` flip
+///     is not enough on macOS 15 once the tap has been disabled. The
+///     `rearm()` method is the only place that rebuilds the CFMachPort.
 final class PushToTalkMonitor {
 
     private let logger = AppLogger.make("PushToTalk")
@@ -39,13 +40,23 @@ final class PushToTalkMonitor {
             logger.debug("PushToTalkMonitor already running")
             return
         }
+        installTap()
+    }
 
-        // We only want the flags-changed events: a single bit tells us
-        // which modifier went down/up, plus the keycode tells us which one.
+    /// Tears down the tap and re-creates it from scratch. Used when
+    /// macOS sends a `tapDisabledBy*` event — `CGEvent.tapEnable(true)`
+    /// alone is not enough on macOS 15; the underlying CFMachPort
+    /// appears to be in a half-broken state after the disable and
+    /// refuses to deliver any further events. Recreating the tap is
+    /// the only reliable re-arm.
+    private func rearm() {
+        NSLog("toi_companion: PushToTalk re-arming (tear down + recreate)")
+        teardownTap()
+        installTap()
+    }
+
+    private func installTap() {
         let eventMask: CGEventMask = (1 << CGEventType.flagsChanged.rawValue)
-
-        // The callback must be a C function — we use a trampoline that
-        // forwards to the Swift instance stored in userInfo.
         let userInfo = Unmanaged.passUnretained(self).toOpaque()
 
         guard let tap = CGEvent.tapCreate(
@@ -56,7 +67,7 @@ final class PushToTalkMonitor {
             callback: PushToTalkMonitor.cgEventCallback,
             userInfo: userInfo
         ) else {
-            logger.error("Failed to create CGEvent tap. macOS may be denying it.")
+            NSLog("toi_companion: PushToTalk FAILED to create CGEvent tap — macOS is denying it (cdhash / TCC / sandbox issue)")
             return
         }
 
@@ -66,38 +77,43 @@ final class PushToTalkMonitor {
 
         self.eventTap = tap
         self.runLoopSource = source
-        let keyName = key.displayName
-        logger.info("PushToTalkMonitor started for \(keyName)")
+        NSLog("toi_companion: PushToTalkMonitor installed for \(key.displayName) (keycode=\(key.rawValue))")
     }
 
-    /// Removes the tap and the run loop source.
-    func stop() {
+    private func teardownTap() {
         guard let tap = eventTap, let source = runLoopSource else { return }
         CGEvent.tapEnable(tap: tap, enable: false)
         CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
         self.eventTap = nil
         self.runLoopSource = nil
-        logger.info("PushToTalkMonitor stopped")
+    }
+
+    /// Removes the tap and the run loop source.
+    func stop() {
+        teardownTap()
+        NSLog("toi_companion: PushToTalkMonitor stopped")
     }
 
     // MARK: - Callback
 
-    /// C-function trampoline. Pulls the Swift instance back out of `userInfo`
-    /// and forwards the event. Returns nil because we never consume events.
+    /// C-function trampoline. For `.listenOnly` taps we return the event
+    /// unchanged so macOS keeps delivering events to us. The Swift bridge
+    /// auto-wraps `event` in `Unmanaged` for us.
     private static let cgEventCallback: CGEventTapCallBack = { _, type, event, userInfo in
-        guard let userInfo = userInfo else { return nil }
+        guard let userInfo = userInfo else { return Unmanaged.passUnretained(event) }
         let monitor = Unmanaged<PushToTalkMonitor>.fromOpaque(userInfo).takeUnretainedValue()
         monitor.handleEvent(type: type, event: event)
-        return nil
+        return Unmanaged.passUnretained(event)
     }
 
     private func handleEvent(type: CGEventType, event: CGEvent) {
-        // Re-arm the tap if macOS disabled it (timeout or user input).
-        // Without this, the hotkey would silently die after a while.
+        // Re-arm the tap if macOS disabled it. The simple re-enable that
+        // earlier versions of this file used is unreliable on macOS 15;
+        // we tear down and recreate the tap instead.
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-            logger.warning("CGEvent tap disabled (\(type.rawValue)) — re-arming")
-            if let tap = eventTap {
-                CGEvent.tapEnable(tap: tap, enable: true)
+            NSLog("toi_companion: PushToTalk tap disabled (type=\(type.rawValue)) — recreating")
+            DispatchQueue.main.async { [weak self] in
+                self?.rearm()
             }
             return
         }
@@ -105,11 +121,11 @@ final class PushToTalkMonitor {
         guard type == .flagsChanged else { return }
 
         let keycode = Int(event.getIntegerValueField(.keyboardEventKeycode))
-        guard keycode == key.rawValue else { return }
-
         let flags = event.flags
-        let nowPressed = flags.contains(key.pressedFlag)
+        NSLog("toi_companion: PushToTalk flagsChanged keycode=\(keycode) expected=\(self.key.rawValue) flags=\(flags.rawValue) pressed=\(flags.contains(self.key.pressedFlag))")
+        guard keycode == self.key.rawValue else { return }
 
+        let nowPressed = flags.contains(self.key.pressedFlag)
         guard nowPressed != isPressed else { return }
         isPressed = nowPressed
 
@@ -117,10 +133,10 @@ final class PushToTalkMonitor {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
             if nowPressed {
-                self.logger.debug("\(self.key.displayName) pressed")
+                NSLog("toi_companion: PushToTalk \(self.key.displayName) PRESSED")
                 self.delegate?.pushToTalkDidPress()
             } else {
-                self.logger.debug("\(self.key.displayName) released")
+                NSLog("toi_companion: PushToTalk \(self.key.displayName) RELEASED")
                 self.delegate?.pushToTalkDidRelease()
             }
         }
