@@ -2,20 +2,24 @@ import AVFoundation
 import os.log
 
 /// Captures audio from the default microphone using AVAudioEngine and
-/// streams downsampled buffers to consumers (STT, RMS meter, etc.).
+/// streams 16 kHz mono Float32 buffers to consumers (STT, RMS meter, etc.).
 ///
-/// Phase 2: provides the raw input tap and an AsyncStream of buffers
-/// at the STT's target format (16 kHz mono Float32).
+/// The hardware delivers buffers at its native format (typically 44.1 kHz
+/// or 48 kHz stereo Float32). We resample + downmix to the STT format
+/// (16 kHz mono Float32) inside `handleBuffer` using the closure-based
+/// `AVAudioConverter.convert(to:error:withInputFrom:)` API — the simple
+/// `convert(to:from:)` API throws paramErr (-50) on the 44.1 kHz stereo
+/// → 16 kHz mono path. A fresh converter is built per buffer (the
+/// converter object retains state across calls).
 final class AudioCapture {
 
     private let logger = Logger(subsystem: "com.salem.toicompanion", category: "AudioCapture")
     private let engine = AVAudioEngine()
-    private let converter: AVAudioConverter?
 
     private var continuation: AsyncStream<AVAudioPCMBuffer>.Continuation?
     private var isCapturing = false
 
-    /// Stream of audio buffers at the STT's target format.
+    /// Stream of audio buffers at the input node's native format.
     /// Buffers arrive on a high-priority background queue — not the main actor.
     let stream: AsyncStream<AVAudioPCMBuffer>
 
@@ -30,11 +34,6 @@ final class AudioCapture {
     // MARK: - Init
 
     init() {
-        // Build the converter once: hardware → STT format.
-        // We'll set the source format when the engine starts (it has a
-        // hardware-specific input format we can't know in advance).
-        self.converter = nil
-
         var cont: AsyncStream<AVAudioPCMBuffer>.Continuation!
         self.stream = AsyncStream<AVAudioPCMBuffer> { continuation in
             cont = continuation
@@ -48,93 +47,123 @@ final class AudioCapture {
     /// Idempotent: calling start() when already capturing is a no-op.
     func start() throws {
         guard !isCapturing else {
-            logger.debug("AudioCapture already running")
+            NSLog("toi_companion: AudioCapture already running, ignoring duplicate start")
             return
         }
 
         let inputNode = engine.inputNode
-        let inputFormat = inputNode.outputFormat(forBus: 0)
-        logger.info("Input format: \(inputFormat.sampleRate) Hz, \(inputFormat.channelCount) channels")
+        let hardwareFormat = inputNode.outputFormat(forBus: 0)
+        NSLog("toi_companion: AudioCapture hardware format: \(hardwareFormat.sampleRate) Hz, \(hardwareFormat.channelCount) ch")
 
-        // Build a fresh converter for this hardware format.
-        let converter = AVAudioConverter(from: inputFormat, to: AudioFormat.sttFormat)
-        guard let converter = converter else {
-            throw AudioCaptureError.converterUnavailable
-        }
-
-        // Install the tap. The closure runs on a background audio thread.
+        // Tap at the hardware format. We do the sample-rate + channel
+        // conversion in handleBuffer with a fresh AVAudioConverter per
+        // buffer — the closure-based API is the only one that handles
+        // 44.1 kHz stereo → 16 kHz mono, and the converter object keeps
+        // state so re-using it across buffers gets stuck after one use.
         inputNode.installTap(
             onBus: 0,
             bufferSize: 4096,
-            format: inputFormat
+            format: hardwareFormat
         ) { [weak self] buffer, _ in
             guard let self = self else { return }
-            self.handleBuffer(buffer, converter: converter)
+            self.handleBuffer(buffer)
         }
 
         engine.prepare()
         try engine.start()
         isCapturing = true
-        logger.info("AudioCapture started")
+        NSLog("toi_companion: AudioCapture started, engine running")
     }
 
     /// Stops the audio engine and closes the stream.
     func stop() {
-        guard isCapturing else { return }
+        guard isCapturing else {
+            NSLog("toi_companion: AudioCapture stop() called but not capturing (idempotent)")
+            return
+        }
+        NSLog("toi_companion: AudioCapture stopping (engine and stream)")
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
         continuation?.finish()
         isCapturing = false
-        logger.info("AudioCapture stopped")
+        NSLog("toi_companion: AudioCapture stopped")
     }
 
     deinit {
+        NSLog("toi_companion: AudioCapture deinit")
         stop()
     }
 
     // MARK: - Internal
 
-    private func handleBuffer(_ inputBuffer: AVAudioPCMBuffer, converter: AVAudioConverter) {
-        // Compute RMS for visual feedback.
-        let rms = Self.computeRMS(inputBuffer)
+    private var handleBufferCount = 0
+
+    private func handleBuffer(_ inputBuffer: AVAudioPCMBuffer) {
+        handleBufferCount += 1
+        let inputFrameCount = inputBuffer.frameLength
+        let inputFormat = inputBuffer.format
+
+        // Build a fresh converter every call. AVAudioConverter is stateful
+        // and gets stuck after one use; recreating is the simplest fix.
+        let outputFormat = AudioFormat.sttFormat
+        guard let converter = AVAudioConverter(from: inputFormat, to: outputFormat) else {
+            NSLog("toi_companion: AudioCapture could not create converter")
+            return
+        }
+
+        // Allocate the output buffer large enough to hold the worst-case
+        // full conversion in one shot. For 44.1 kHz → 16 kHz with frame
+        // size 4096, the output is ~1486 frames; round up generously.
+        let outputCapacity = AVAudioFrameCount(
+            Double(inputFrameCount) * outputFormat.sampleRate / inputFormat.sampleRate + 1024
+        )
+        guard let outputBuffer = AVAudioPCMBuffer(
+            pcmFormat: outputFormat,
+            frameCapacity: outputCapacity
+        ) else {
+            NSLog("toi_companion: AudioCapture could not allocate output buffer")
+            return
+        }
+
+        // Closure-based convert API. The closure is called repeatedly; we
+        // hand it the whole input buffer the first time and signal
+        // end-of-stream the second time. The closure's return type is
+        // non-optional AVAudioPCMBuffer, so we return the same buffer
+        // both times and rely on the status pointer to communicate
+        // whether we want more data.
+        var inputProvided = false
+        var convertError: NSError?
+        converter.convert(to: outputBuffer, error: &convertError) { _, outStatus in
+            if !inputProvided {
+                inputProvided = true
+                outStatus.pointee = AVAudioConverterInputStatus.haveData
+                return inputBuffer
+            } else {
+                outStatus.pointee = AVAudioConverterInputStatus.endOfStream
+                return inputBuffer
+            }
+        }
+
+        if let convertError = convertError {
+            NSLog("toi_companion: AudioCapture convert error: \(convertError.localizedDescription)")
+            return
+        }
+
+        let outputFrameCount = outputBuffer.frameLength
+        if outputFrameCount == 0 {
+            // No audio produced this round — skip silently. Happens
+            // occasionally on the very first buffer while the converter
+            // warms up.
+            return
+        }
+
+        // Compute RMS for visual feedback (on the converted buffer).
+        let rms = Self.computeRMS(outputBuffer)
         rmsLock.lock()
         _rms = rms
         rmsLock.unlock()
 
-        // Convert to STT format.
-        let outputBuffer = AVAudioPCMBuffer(
-            pcmFormat: AudioFormat.sttFormat,
-            frameCapacity: AVAudioFrameCount(
-                Double(inputBuffer.frameLength) * AudioFormat.sttFormat.sampleRate / inputBuffer.format.sampleRate
-            )
-        )
-
-        guard let outputBuffer = outputBuffer else {
-            logger.error("Could not allocate output buffer")
-            return
-        }
-
-        var error: NSError?
-        var inputFed = false
-
-        let status = converter.convert(to: outputBuffer, error: &error) { _, outStatus in
-            if inputFed {
-                outStatus.pointee = .endOfStream
-                return nil
-            }
-            inputFed = true
-            outStatus.pointee = .haveData
-            return inputBuffer
-        }
-
-        if status == .error {
-            logger.error("Conversion error: \(error?.localizedDescription ?? "unknown")")
-            return
-        }
-
-        if outputBuffer.frameLength > 0 {
-            continuation?.yield(outputBuffer)
-        }
+        continuation?.yield(outputBuffer)
     }
 
     /// Computes the root mean square (RMS) of a Float32 PCM buffer.
