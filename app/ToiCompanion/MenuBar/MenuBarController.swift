@@ -42,6 +42,16 @@ final class MenuBarController {
         testAudio.target = self
         menu.addItem(testAudio)
 
+        // Phase 3: trigger a 3-second STT test that captures speech and
+        // shows the transcript in the sticky note.
+        let testSTT = NSMenuItem(
+            title: "Test STT (3s)",
+            action: #selector(MenuBarController.testSTTTapped),
+            keyEquivalent: ""
+        )
+        testSTT.target = self
+        menu.addItem(testSTT)
+
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "About toi_companion", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
@@ -53,8 +63,17 @@ final class MenuBarController {
     // MARK: - Actions
 
     @objc private func testAudioTapped() {
-        logger.info("Test Audio triggered")
-        actions?.didRequestTestAudio()
+        MainActor.assumeIsolated {
+            logger.info("Test Audio triggered")
+            actions?.didRequestTestAudio()
+        }
+    }
+
+    @objc private func testSTTTapped() {
+        MainActor.assumeIsolated {
+            logger.info("Test STT triggered")
+            actions?.didRequestTestSTT()
+        }
     }
 
     // MARK: - Public
@@ -68,7 +87,10 @@ final class MenuBarController {
 }
 
 /// Actions the menu can request. AppDelegate adopts this to bridge
-/// menu items to the components they should drive.
+/// menu items to the components they should drive. All methods run on
+/// the main actor (NSMenu callbacks are always delivered on main).
+@MainActor
 protocol MenuBarActions: AnyObject {
     func didRequestTestAudio()
+    func didRequestTestSTT()
 }
