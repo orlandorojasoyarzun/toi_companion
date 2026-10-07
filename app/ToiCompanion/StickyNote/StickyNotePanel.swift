@@ -62,8 +62,10 @@ final class StickyNotePanel: NSPanel {
     }
 
     private func configurePanel() {
-        // Never activate or become key — override the properties.
-        ignoresMouseEvents = true
+        // Accept mouse events so the user can dismiss the panel with a
+        // click (see mouseDown below). canBecomeKey/Main stay false so
+        // the click doesn't steal focus from the app underneath.
+        ignoresMouseEvents = false
 
         // Float above everything except fullscreen exclusive windows.
         level      = .floating
@@ -77,9 +79,42 @@ final class StickyNotePanel: NSPanel {
         logger.info("StickyNotePanel configured")
     }
 
+    /// Click anywhere on the panel to dismiss it. Used by `stayUntilClick`
+    /// for terminal states (LLM response, error) where the message should
+    /// linger until the user is ready to move on. Clicks during the
+    /// listening/streaming phases still dismiss — the LLM task that was
+    /// writing to the panel is cancelled on the next PTT press anyway.
+    ///
+    /// Phase 7.2: a click in the top bar is treated as a window-drag
+    /// gesture so the user can grab the note and move it. The X button
+    /// in the bar calls `hide()` directly through the SwiftUI `onClose`
+    /// closure.
+/// Phase 7.3: body clicks no longer close the panel. Only the X does,
+/// so the user can read an LLM answer without accidentally dismissing
+/// it by clicking on the note while looking at it.
+    override func mouseDown(with event: NSEvent) {
+        let inTopBar = event.locationInWindow.y >= frame.height - StickyNoteView.topBarHeight
+        if inTopBar {
+            // Hand off to AppKit's window-drag machinery. SwiftUI's X
+            // button consumes mouseDowns inside its frame, so a click
+            // that reaches us here is always in the drag-grip area.
+            // `performDrag` is an NSWindow method; NSPanel inherits it,
+            // so we call it on self directly without going through
+            // `self.window?` (the latter doesn't resolve in this scope).
+            performDrag(with: event)
+            return
+        }
+        // Body click — deliberately a no-op. See Phase 7.3 above.
+    }
+
     private func configureContent() {
-        // Wrap SwiftUI view in NSHostingView.
-        let hostingView = NSHostingView(rootView: StickyNoteView(viewModel: viewModel))
+        // Wrap SwiftUI view in NSHostingView. `onClose` is the X button
+        // in the top bar — wired to `hide()` so the panel actually
+        // dismisses when the user clicks ×.
+        let hostingView = NSHostingView(rootView: StickyNoteView(
+            viewModel: viewModel,
+            onClose: { [weak self] in self?.hide() }
+        ))
         hostingView.frame = NSRect(origin: .zero, size: hostingView.fittingSize)
         hostingView.autoresizingMask = [.width, .height]
 
@@ -148,9 +183,19 @@ final class StickyNotePanel: NSPanel {
     /// then fade out. Used at the end of a response cycle.
     func scheduleHide() {
         hideTimer?.invalidate()
+        hideTimer = nil
         hideTimer = Timer.scheduledTimer(withTimeInterval: stayDuration, repeats: false) { [weak self] _ in
             self?.fadeOut()
         }
+    }
+
+    /// Keep the sticky note visible until the user clicks it. Cancels
+    /// any pending auto-hide timer. Used for terminal states (LLM
+    /// response, errors) where 2 seconds is too short to read.
+    /// Click → `mouseDown` → `hide()` (fast fade).
+    func stayUntilClick() {
+        hideTimer?.invalidate()
+        hideTimer = nil
     }
 
     private func fadeOut() {
@@ -174,20 +219,31 @@ final class StickyNotePanel: NSPanel {
     // MARK: - Layout
 
     /// Resizes the panel to fit the SwiftUI view's intrinsic content size.
-    /// Anchors the bottom edge (near the cursor) and grows upward, with
-    /// clamping against the screen's visible frame so the panel never
-    /// extends off the top of the screen.
-    private func resizeToFit() {
-        guard let contentView = contentView,
-              let hostingView = contentView.subviews.first as? NSHostingView<StickyNoteView> else { return }
+/// Anchors the bottom edge (near the cursor) and grows upward, with
+/// clamping against the screen's visible frame so the panel never
+/// extends off the top of the screen.
+///
+/// Phase 7.4: an `invalidateIntrinsicContentSize()` call before
+/// `layoutSubtreeIfNeeded()` forces NSHostingView to recompute its
+/// cached size. Without it, the host can return a stale `fittingSize`
+/// during a fast LLM stream — the SwiftUI tree has updated, but the
+/// hosting view's cached intrinsic content size is still from the
+/// previous text, so the panel appears to "stop growing" mid-stream.
+private func resizeToFit() {
+    guard let contentView = contentView,
+          let hostingView = contentView.subviews.first as? NSHostingView<StickyNoteView> else { return }
 
-        hostingView.layoutSubtreeIfNeeded()
-        let fittingSize = hostingView.fittingSize
-        guard fittingSize.width > 0, fittingSize.height > 0 else { return }
+    hostingView.invalidateIntrinsicContentSize()
+    hostingView.layoutSubtreeIfNeeded()
+    let fittingSize = hostingView.fittingSize
+    guard fittingSize.width > 0, fittingSize.height > 0 else { return }
 
         let bottomY = frame.origin.y
         let originX = frame.origin.x
-        let newWidth  = max(260, fittingSize.width)
+        // Floor width at 280 to match StickyNoteView's `minPanelWidth`.
+        // The view itself caps at 520, so we just honour whatever it
+        // asks for above 280.
+        let newWidth  = max(280, fittingSize.width)
         var newHeight = max(minPanelHeight, fittingSize.height)
 
         // Clamp: don't let the top of the panel go above the visible screen
