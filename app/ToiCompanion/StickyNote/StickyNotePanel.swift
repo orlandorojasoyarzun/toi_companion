@@ -25,6 +25,12 @@ final class StickyNotePanel: NSPanel {
     private let fadeInDuration: TimeInterval  = 0.20
     private let fadeOutDuration: TimeInterval = 0.40
     private let stayDuration:     TimeInterval = 2.00  // Phase 5+: after stream ends
+    private let edgeMargin:       CGFloat     = 20
+    /// Floor for the panel's height. Matches the original Phase 1 size:
+    /// enough for the header + ~4 lines of text so the panel reads as
+    /// "an empty note" before the user starts talking. When the transcript
+    /// exceeds this, the panel keeps growing upward.
+    private let minPanelHeight:   CGFloat     = 140
 
     private var hideTimer: Timer?
 
@@ -110,6 +116,10 @@ final class StickyNotePanel: NSPanel {
         alphaValue = 0
         orderFront(nil)
         viewModel.show(initialText: initialText)
+        // Size the panel to fit the initial text. SwiftUI needs a runloop
+        // to re-render after the @Published change, so we force a layout
+        // pass before measuring.
+        resizeToFit()
 
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = fadeInDuration
@@ -158,6 +168,41 @@ final class StickyNotePanel: NSPanel {
     @MainActor
     func updateText(_ text: String) {
         viewModel.updateText(text)
+        resizeToFit()
+    }
+
+    // MARK: - Layout
+
+    /// Resizes the panel to fit the SwiftUI view's intrinsic content size.
+    /// Anchors the bottom edge (near the cursor) and grows upward, with
+    /// clamping against the screen's visible frame so the panel never
+    /// extends off the top of the screen.
+    private func resizeToFit() {
+        guard let contentView = contentView,
+              let hostingView = contentView.subviews.first as? NSHostingView<StickyNoteView> else { return }
+
+        hostingView.layoutSubtreeIfNeeded()
+        let fittingSize = hostingView.fittingSize
+        guard fittingSize.width > 0, fittingSize.height > 0 else { return }
+
+        let bottomY = frame.origin.y
+        let originX = frame.origin.x
+        let newWidth  = max(260, fittingSize.width)
+        var newHeight = max(minPanelHeight, fittingSize.height)
+
+        // Clamp: don't let the top of the panel go above the visible screen
+        // (i.e. under the menu bar). If it would, cap the height.
+        if let screen = self.screen ?? NSScreen.main {
+            let maxTopY = screen.visibleFrame.maxY - edgeMargin
+            if bottomY + newHeight > maxTopY {
+                newHeight = max(minPanelHeight, maxTopY - bottomY)
+            }
+        }
+
+        let newFrame = NSRect(x: originX, y: bottomY, width: newWidth, height: newHeight)
+        if newFrame.size != frame.size {
+            setFrame(newFrame, display: true, animate: false)
+        }
     }
 }
 

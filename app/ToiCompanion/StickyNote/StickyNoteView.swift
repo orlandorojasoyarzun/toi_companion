@@ -35,13 +35,19 @@ struct StickyNoteView: View {
                 Text(viewModel.text.isEmpty ? "..." : viewModel.text)
                     .font(.system(size: fontSize, weight: .regular, design: .monospaced))
                     .foregroundColor(dosWhite)
-                    .lineLimit(6)
                     .multilineTextAlignment(.leading)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
             }
             .padding(padding)
         }
-        .frame(width: 260, height: 140)
+        .frame(width: 260)
+        // minHeight matches the panel's floor; lets the Rectangle fill the
+        // whole panel with dosBlue so there's no blurred-desktop gap below
+        // the text. fixedSize still lets the view grow when the transcript
+        // exceeds this height.
+        .frame(minHeight: 140)
+        .fixedSize(horizontal: false, vertical: true)
     }
 }
 
@@ -52,10 +58,11 @@ struct StickyNoteView_Previews: PreviewProvider {
     static var previews: some View {
         StickyNoteView(viewModel: {
             let vm = StickyNoteViewModel()
-            vm.text = "Hello from toi_companion!"
+            vm.text = "Hello from toi_companion! This is a longer message that should make the panel grow downward to accommodate the full text without truncating with ellipsis."
             return vm
         }())
-        .frame(width: 260, height: 140)
+        .frame(width: 260)
+        .fixedSize(horizontal: false, vertical: true)
         .background(Color.black)
     }
 }
