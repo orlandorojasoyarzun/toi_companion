@@ -50,6 +50,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.actions = self
         menuBarController = menu
 
+        // Wire the panel's "send" callback to the LLM runner. The
+        // StickyNoteView calls this from Enter / ✓ after the user
+        // has reviewed (and optionally edited) the transcript.
+        StickyNotePanel.shared.onSendRequested = { [weak self] text in
+            self?.sendCurrentTranscript(text)
+        }
+
         // Phase 2: request mic + speech recognition permission on first launch.
         Task { @MainActor in
             let result = await permissionGate.requestAllPermissions()
@@ -217,6 +224,28 @@ extension AppDelegate: MenuBarActions {
         SettingsWindowController.shared.show()
     }
 
+    /// Send the panel's current transcript to the LLM. Triggered by
+    /// the sticky note's Enter key (NSTextView insertNewline) or the
+    /// ✓ button in the top bar. Mirrors the .finalized branch that
+    /// used to auto-send, but only fires when the user explicitly
+    /// confirms. Empty / whitespace-only text → hide (nothing to
+    /// ask).
+    @MainActor
+    private func sendCurrentTranscript(_ text: String) {
+        if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            StickyNotePanel.shared.hide()
+            return
+        }
+        currentLLMTask?.cancel()
+        currentLLMTask = Task { @MainActor in
+            await self.runLLMStream(
+                systemPrompt: "Be concise. Respond in the user's language.",
+                userPrompt: text,
+                errorPrefix: "llm"
+            )
+        }
+    }
+
     /// Shared LLM-stream runner. Sends the messages, paints progress
     /// to the sticky note, and schedules the hide on completion. Both
     /// the Test LLM menu and the PTT-release pipeline funnel through
@@ -227,6 +256,14 @@ extension AppDelegate: MenuBarActions {
         userPrompt: String,
         errorPrefix: String
     ) async {
+        // Freeze the panel's size during the stream so the rapid
+        // updateText() → resizeToFit() → setFrame() chain doesn't
+        // cause visual glitches and z-order drops. The defer
+        // unfreezes and triggers a final resize with the complete
+        // response, no matter how this function exits.
+        StickyNotePanel.shared.setIsStreaming(true)
+        defer { StickyNotePanel.shared.setIsStreaming(false) }
+
         let messages = [
             ChatMessage(role: .system, content: systemPrompt),
             ChatMessage(role: .user, content: userPrompt),
@@ -377,18 +414,15 @@ extension AppDelegate: SpeechRecognizerDelegate {
                 return
             }
 
-            // Phase 4: replace the sticky-note text with the LLM stream.
-            // Cancel any in-flight stream first so two finals back to
-            // back don't fight for the panel.
+            // v2 edit-on-finalize: paint the transcript, cancel any
+            // in-flight LLM stream (a new send will start a new one),
+            // and enter edit mode so the user can correct it before
+            // pressing Enter (or the ✓ button) to actually send. This
+            // matches the v1 flow where the message wasn't sent by
+            // itself — Enter is the explicit "go" trigger.
             StickyNotePanel.shared.updateText(text)
             currentLLMTask?.cancel()
-            currentLLMTask = Task { @MainActor in
-                await self.runLLMStream(
-                    systemPrompt: "Be concise. Respond in the user's language.",
-                    userPrompt: text,
-                    errorPrefix: "llm"
-                )
-            }
+            StickyNotePanel.shared.beginEditMode()
         case .error(let error):
             NSLog("toi_companion: STT error: \(error.localizedDescription)")
             // Empty body, auto-hide. The user tapped Shift briefly (e.g.
