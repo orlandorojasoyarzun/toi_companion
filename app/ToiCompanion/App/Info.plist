@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>$(EXECUTABLE_NAME)</string>
+    <key>CFBundleIdentifier</key>
+    <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>$(PRODUCT_NAME)</string>
+    <key>CFBundleDisplayName</key>
+    <string>toi_companion</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>$(MARKETING_VERSION)</string>
+    <key>CFBundleVersion</key>
+    <string>$(CURRENT_PROJECT_VERSION)</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>$(MACOSX_DEPLOYMENT_TARGET)</string>
+    <!-- Menu bar app: no Dock icon, no main window. -->
+    <key>LSUIElement</key>
+    <true/>
+    <!-- Required for AVAudioApplication.requestRecordPermission. -->
+    <key>NSMicrophoneUsageDescription</key>
+    <string>toi_companion listens while you hold the push-to-talk key, then stops.</string>
+    <!-- Required for SFSpeechRecognizer / SpeechAnalyzer. -->
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>toi_companion transcribes what you say locally on this Mac for the duration of a single push-to-talk.</string>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+    <!-- Disable ATS exceptions: we always talk to the Worker over HTTPS. -->
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsArbitraryLoads</key>
+        <false/>
+    </dict>
+</dict>
+</plist>
