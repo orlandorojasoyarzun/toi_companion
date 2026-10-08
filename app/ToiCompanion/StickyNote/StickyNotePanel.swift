@@ -38,6 +38,13 @@ final class StickyNotePanel: NSPanel {
 
     static let shared = StickyNotePanel()
 
+    /// Set by the AppDelegate to receive "send the current text to
+    /// the LLM" requests from the sticky note's Enter key or ✓
+    /// button. The closure receives the panel's current
+    /// `viewModel.text` at the moment of the send. nil = no-op
+    /// (the panel still works, just no send happens).
+    var onSendRequested: ((String) -> Void)? = nil
+
     // MARK: - Init
 
     private init() {
@@ -113,7 +120,11 @@ final class StickyNotePanel: NSPanel {
         // dismisses when the user clicks ×.
         let hostingView = NSHostingView(rootView: StickyNoteView(
             viewModel: viewModel,
-            onClose: { [weak self] in self?.hide() }
+            onClose: { [weak self] in self?.hide() },
+            onSend: { [weak self] in
+                guard let self = self else { return }
+                self.onSendRequested?(self.viewModel.text)
+            }
         ))
         hostingView.frame = NSRect(origin: .zero, size: hostingView.fittingSize)
         hostingView.autoresizingMask = [.width, .height]
@@ -131,6 +142,13 @@ final class StickyNotePanel: NSPanel {
 
         blurView.addSubview(hostingView)
 
+        // Force the visual effect view to redraw its layer on every
+        // needsDisplay instead of caching a snapshot. Without this,
+        // fast panel resizes (via the bottom-right grip) leave a
+        // visible "ghost" of the previous frame because the cached
+        // layer contents don't keep up with the new bounds.
+        blurView.layerContentsRedrawPolicy = .onSetNeedsDisplay
+
         // The panel itself has no background — the visual effect view provides the blur.
         contentView = blurView
     }
@@ -143,6 +161,13 @@ final class StickyNotePanel: NSPanel {
         hideTimer?.invalidate()
         hideTimer = nil
 
+        // Phase 7.8: reset the user-resize override so the panel
+        // always starts at the default "listening" size, even if
+        // the user dragged the grip on a previous show. The grip
+        // still works *within* a single show — this just clears
+        // the carryover between shows.
+        viewModel.userSize = nil
+
         // Reposition near cursor.
         let origin = cursorPositioner.computeOrigin()
         setFrameOrigin(NSPoint(x: origin.x, y: origin.y))
@@ -151,10 +176,15 @@ final class StickyNotePanel: NSPanel {
         alphaValue = 0
         orderFront(nil)
         viewModel.show(initialText: initialText)
-        // Size the panel to fit the initial text. SwiftUI needs a runloop
-        // to re-render after the @Published change, so we force a layout
-        // pass before measuring.
-        resizeToFit()
+        // Phase 7.7: no resize on show. The panel's size is set in
+        // `init()` (greeting size) and only changes when the user
+        // drags the grip. LLM responses scroll inside the
+        // ScrollView instead of growing the panel. Calling
+        // `resizeToFit()` here would re-fit the panel on every
+        // show (the "re-arrange" glitch the user reported) and
+        // also leave a brief window where the NSVisualEffectView
+        // shows a stale blur of the old frame — the gray trail
+        // behind the note.
 
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = fadeInDuration
@@ -177,6 +207,29 @@ final class StickyNotePanel: NSPanel {
             self?.orderOut(nil)
             self?.viewModel.hide()
         })
+    }
+
+    /// Enter edit mode after a PTT finalize, so the user can correct
+    /// the transcript before sending. Mirrors the ↲ button's effect
+    /// but doesn't require a click — the panel activates and the
+    /// freshly-created NSTextView becomes first responder for
+    /// immediate typing. The user then commits with Enter (or the
+    /// ✓ button), or cancels with Escape.
+    func beginEditMode() {
+        viewModel.isEditing = true
+        DispatchQueue.main.async {
+            NSApp.activate(ignoringOtherApps: true)
+            self.makeKeyAndOrderFront(nil)
+        }
+    }
+
+    /// Mark the start/end of an LLM stream. The panel is fixed-size
+    /// now (the SwiftUI view fills the frame and a long response
+    /// scrolls inside the ScrollView), so this no longer drives
+    /// any resize — the flag is kept for UI affordances and as a
+    /// defensive gate inside `resizeToFit()`.
+    func setIsStreaming(_ streaming: Bool) {
+        viewModel.isStreaming = streaming
     }
 
     /// Schedules the sticky note to hide after `stayDuration` seconds,
@@ -219,9 +272,11 @@ final class StickyNotePanel: NSPanel {
     // MARK: - Layout
 
     /// Resizes the panel to fit the SwiftUI view's intrinsic content size.
-/// Anchors the bottom edge (near the cursor) and grows upward, with
-/// clamping against the screen's visible frame so the panel never
-/// extends off the top of the screen.
+/// Anchors the **top edge** and grows downward as the LLM response
+/// streams in, so the user can see the text arriving instead of it
+/// being hidden behind a scroll. Clamped to `maxAutoFitHeight` so a
+/// runaway stream doesn't push the panel off the screen; beyond
+/// the cap, the inner `ScrollView` takes over.
 ///
 /// Phase 7.4: an `invalidateIntrinsicContentSize()` call before
 /// `layoutSubtreeIfNeeded()` forces NSHostingView to recompute its
@@ -231,48 +286,48 @@ final class StickyNotePanel: NSPanel {
 /// previous text, so the panel appears to "stop growing" mid-stream.
 ///
 /// Phase 7.5: if the user has dragged the resize grip and we have a
-/// `userSize` override, honour it instead of the natural content size.
-/// Otherwise use the natural size as before.
+/// `userSize` override, honour it instead of the natural content size
+/// (no auto-fit, no auto-grow — the user owns the size from then on).
+///
+/// Phase 7.8: re-enabled the auto-grow behaviour. Phase 7.7 had made
+/// this a no-op so the panel stayed at the greeting size and the
+/// response scrolled inside the ScrollView. The user reported that
+/// this hid the streaming text and didn't "invite" them to open the
+/// note — they want the note to visibly grow as the LLM types.
 private func resizeToFit() {
-    guard let contentView = contentView,
-          let hostingView = contentView.subviews.first as? NSHostingView<StickyNoteView> else { return }
+    guard let hostingView = contentView?.subviews.first as? NSHostingView<StickyNoteView> else { return }
 
     // Save the current panel size back into the view model so the
-    // resize grip can read it on the next drag. Do this before
-    // potentially calling setFrame so the grip always knows the size
-    // we ended up with.
+    // resize grip can read it on the next drag.
     viewModel.currentPanelSize = frame.size
 
-    // If the user resized the panel, don't override their size.
-    if viewModel.userSize != nil { return }
+    // Phase 7.5: if the user has manually resized, respect their
+    // size and stop auto-fitting. The drag-grip owns the size from
+    // here on.
+    if viewModel.userSize != nil {
+        return
+    }
 
+    // Phase 7.4: force the hosting view to recompute its intrinsic
+    // content size. Without this, the host can return a stale
+    // `fittingSize` during a fast LLM stream.
     hostingView.invalidateIntrinsicContentSize()
     hostingView.layoutSubtreeIfNeeded()
+
+    // Phase 7.8: grow downward (anchor top-left) up to a cap.
+    // Beyond the cap the inner ScrollView handles the overflow.
     let fittingSize = hostingView.fittingSize
-    guard fittingSize.width > 0, fittingSize.height > 0 else { return }
+    let maxAutoFitHeight: CGFloat = 500
+    let targetHeight = min(max(fittingSize.height, minPanelHeight), maxAutoFitHeight)
 
-        let bottomY = frame.origin.y
-        let originX = frame.origin.x
-        // Floor width at 280 to match StickyNoteView's `minPanelWidth`.
-        // The view itself caps at 520, so we just honour whatever it
-        // asks for above 280.
-        let newWidth  = max(280, fittingSize.width)
-        var newHeight = max(minPanelHeight, fittingSize.height)
-
-        // Clamp: don't let the top of the panel go above the visible screen
-        // (i.e. under the menu bar). If it would, cap the height.
-        if let screen = self.screen ?? NSScreen.main {
-            let maxTopY = screen.visibleFrame.maxY - edgeMargin
-            if bottomY + newHeight > maxTopY {
-                newHeight = max(minPanelHeight, maxTopY - bottomY)
-            }
-        }
-
-        let newFrame = NSRect(x: originX, y: bottomY, width: newWidth, height: newHeight)
-        if newFrame.size != frame.size {
-            setFrame(newFrame, display: true, animate: false)
-            viewModel.currentPanelSize = newFrame.size
-        }
-    }
+    // Anchor the top-left: push the origin down by the height
+    // delta. Without this the panel would grow upward (away from
+    // the cursor) — same inversion the resize-grip had before the
+    // Phase 7.8 fix.
+    var newFrame = frame
+    let heightDelta = targetHeight - newFrame.size.height
+    newFrame.size.height = targetHeight
+    newFrame.origin.y -= heightDelta
+    setFrame(newFrame, display: true)
 }
-
+}

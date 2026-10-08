@@ -22,6 +22,16 @@ struct WrappedTextField: NSViewRepresentable {
     var font: NSFont
     var textColor: NSColor
     var lineSpacing: CGFloat
+    /// Called when the user presses Enter (Return) inside the
+    /// field. The NSTextView delegate returns true so the newline
+    /// is suppressed. The sticky note wires this to "commit the
+    /// edit and send to the LLM".
+    var onCommit: (() -> Void)? = nil
+    /// Called when the user presses Escape. The text view's
+    /// default `cancelOperation:` is intercepted so the host can
+    /// decide what cancel means (typically: exit edit mode
+    /// without sending).
+    var onCancel: (() -> Void)? = nil
 
     func makeCoordinator() -> Coordinator {
         Coordinator(self)
@@ -32,11 +42,17 @@ struct WrappedTextField: NSViewRepresentable {
         // standard factory that gives us sensible defaults
         // (vertical scroller, borderless, etc.).
         let scrollView = NSTextView.scrollableTextView()
-        scrollView.hasVerticalScroller = false
+        scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = false
         scrollView.borderType = .noBorder
         scrollView.drawsBackground = false
         scrollView.autohidesScrollers = true
+        // Phase 7.7: fill the SwiftUI host's frame. Without this the
+        // scroll view stays at its natural size and the parent's
+        // frame extends past it, leaving a visible gap that the
+        // NSVisualEffectView would show as a blur ring around the
+        // text view.
+        scrollView.autoresizingMask = [.width, .height]
 
         guard let textView = scrollView.documentView as? NSTextView else {
             return scrollView
@@ -161,6 +177,23 @@ struct WrappedTextField: NSViewRepresentable {
             if parent.text != newText {
                 parent.text = newText
             }
+        }
+
+        /// Intercept Return / Escape so the host can react to
+        /// "commit" and "cancel" without the text view consuming
+        /// the keystroke (which would insert a newline or
+        /// dismiss the field editor respectively). Returning true
+        /// tells NSTextView the command was handled.
+        func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            if commandSelector == #selector(NSResponder.insertNewline(_:)) {
+                parent.onCommit?()
+                return true
+            }
+            if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+                parent.onCancel?()
+                return true
+            }
+            return false
         }
     }
 }

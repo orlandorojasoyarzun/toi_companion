@@ -24,6 +24,11 @@ struct StickyNoteView: View {
     /// Called when the user taps the X in the top bar. Wired by the
     /// owning `StickyNotePanel` to `hide()`.
     var onClose: () -> Void = {}
+    /// Called when the user commits the edit (Enter in the text
+    /// view, or the ✓ button in the top bar). Wired by the owning
+    /// `StickyNotePanel` to `AppDelegate.sendCurrentTranscript()`
+    /// so the LLM stream starts.
+    var onSend: () -> Void = {}
 
     private let cornerRadius: CGFloat = 0  // DOS has sharp corners
     private let padding: CGFloat = 12
@@ -31,8 +36,14 @@ struct StickyNoteView: View {
     /// Panel width bounds. The actual width is a smooth function of the
     /// text length — see `preferredWidth` below — but it never goes
     /// outside this range.
-    private let minPanelWidth: CGFloat = 280
-    private let maxPanelWidth: CGFloat = 380
+    ///
+    /// `minPanelWidth` is locked to `CursorPositioner.panelWidth` (340).
+    /// If they're out of sync the SwiftUI body is wider than the NSPanel
+    /// and the right edge of the content (including the ↲ button in the
+    /// top bar) gets clipped by the panel's contentRect — the "buttons
+    /// covered" bug.
+    private let minPanelWidth: CGFloat = 340
+    private let maxPanelWidth: CGFloat = 420
     /// Floor for the panel's height. Matches `StickyNotePanel.minPanelHeight`
     /// so an empty / very-short note still reads as a deliberate note.
     private let minPanelHeight: CGFloat = 140
@@ -40,25 +51,31 @@ struct StickyNoteView: View {
     /// Height of the top control bar. Kept in sync with the parent's
     /// `mouseDown` check so clicks in this band start a window drag
     /// instead of a close.
-    static let topBarHeight: CGFloat = 20
+    ///
+    /// Phase 7.8: bumped from 20 → 24 so the 22-pt-wide X / ↲ buttons
+    /// read as "almost square" instead of "wide rectangles squished
+    /// against the top edge". 24 makes the button frame 22×24 — the
+    /// vertical padding inside the button now matches the horizontal
+    /// padding (`padding(.leading, 10)` / `.trailing, 12)`), so the
+    /// X and ↲ icons sit in the visual middle of the bar.
+    static let topBarHeight: CGFloat = 24
 
     /// Height of the bottom resize grip strip.
     private let bottomGripHeight: CGFloat = 12
 
-    /// Width grows *slowly* with character count. Phase 7.4: a wider
-    /// multiplier (was 0.6) made the panel widen so much that text
-    /// wrapped to fewer lines, which kept the total height constant
-    /// and made the note look "stuck" mid-growth. Capping at 380 with
-    /// a 0.25 multiplier keeps width meaningful but always lets text
-    /// wrap to enough lines that height grows monotonically with the
-    /// number of characters.
+    /// Width matches the panel when the user hasn't dragged the grip.
+    /// Phase 7.7+: the panel is fixed-size at the greeting — LLM
+    /// responses scroll inside the `ScrollView` instead of growing
+    /// the note. The previous text-driven growth formula made the
+    /// SwiftUI body wider than the NSPanel, so the right edge of the
+    /// content (including the ↲ button) got clipped by the
+    /// `contentRect`. Honouring the user's manual resize keeps the
+    /// drag-grip working.
     private var preferredWidth: CGFloat {
         if let userSize = viewModel.userSize {
             return max(minPanelWidth, min(maxPanelWidth, userSize.width))
         }
-        let chars = viewModel.text.count
-        let growth = CGFloat(chars) * 0.25
-        return min(maxPanelWidth, max(minPanelWidth, minPanelWidth + growth))
+        return minPanelWidth
     }
 
     var body: some View {
@@ -68,8 +85,26 @@ struct StickyNoteView: View {
             bottomGrip
         }
         .frame(width: preferredWidth)
-        .frame(minHeight: minPanelHeight)
-        .fixedSize(horizontal: false, vertical: true)
+        // The VStack fills the panel's content area vertically. The
+        // topBar and bottomGrip are fixed-height; the middle (content)
+        // grows to fill the rest via its own `.frame(maxHeight: .infinity)`
+        // so the resize-grip stays pinned to the bottom of the panel.
+        .frame(minHeight: minPanelHeight, maxHeight: .infinity)
+        // NOTE: do NOT add `.background(...)` here. In Phase 7.7 we
+        // added a background on the VStack to keep the NSHostingView
+        // opaque (kill the "gray trail" the NSVisualEffectView showed
+        // through the gaps). That worked in isolation but combined
+        // with `.frame(maxHeight: .infinity)` it makes SwiftUI pick
+        // the View-overload of `.background()` and the "background"
+        // reports an intrinsic size of infinity — the VStack then
+        // grows to fill the screen, the hostingView's fittingSize
+        // explodes, and the panel ends up covering the entire display.
+        //
+        // The children's own `.fill(settings.theme.background)`
+        // backgrounds (in topBar, content's ZStack, and bottomGrip)
+        // already cover the VStack edge-to-edge with no gaps because
+        // the VStack uses `spacing: 0`. So the "gray trail" is gone
+        // without needing a VStack-level background.
     }
 
     /// 20pt strip at the very top.
@@ -88,7 +123,10 @@ struct StickyNoteView: View {
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .padding(.leading, 6)
+            // Bumped from 6 → 10 so the X has a bit more breathing room
+            // from the panel's left edge. At 260 pt the 6 pt padding put
+            // the icon visually flush with the corner.
+            .padding(.leading, 10)
 
             Spacer()
 
@@ -105,7 +143,9 @@ struct StickyNoteView: View {
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .padding(.trailing, 8)
+            // Bumped from 8 → 12 (mirror of the X's 10) so both buttons
+            // sit comfortably inside the panel.
+            .padding(.trailing, 12)
         }
         .frame(height: Self.topBarHeight)
         .background(
@@ -149,22 +189,66 @@ struct StickyNoteView: View {
                         font: NSFont(name: settings.fontFamily, size: settings.fontSize)
                             ?? NSFont.monospacedSystemFont(ofSize: settings.fontSize, weight: .regular),
                         textColor: NSColor(settings.theme.text),
-                        lineSpacing: settings.fontSize * (settings.lineSpacing - 1.0)
+                        lineSpacing: settings.fontSize * (settings.lineSpacing - 1.0),
+                        onCommit: {
+                            // Enter pressed — exit edit mode (async so
+                            // the text view tears down before onSend
+                            // fires and replaces the text) then hand
+                            // off to the LLM stream runner.
+                            DispatchQueue.main.async {
+                                viewModel.isEditing = false
+                                onSend()
+                            }
+                        },
+                        onCancel: {
+                            // Escape — exit edit mode, no send. The
+                            // panel stays visible so the user can
+                            // review or re-edit.
+                            viewModel.isEditing = false
+                        }
                     )
-                    .frame(maxWidth: .infinity, alignment: .topLeading)
+                    // EDIT MODE: the NSScrollView inside the
+                    // NSViewRepresentable fills this frame (its
+                    // autoresizingMask is `.width, .height`), so a
+                    // long transcript scrolls inside the field
+                    // instead of pushing the panel taller.
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                 } else {
-                    // STATIC MODE.
-                    Text(viewModel.text.isEmpty ? "..." : viewModel.text)
-                        .font(.custom(settings.fontFamily, size: settings.fontSize))
-                        .foregroundColor(settings.theme.text)
-                        .multilineTextAlignment(.leading)
-                        .lineSpacing(settings.fontSize * (settings.lineSpacing - 1.0))
-                        .fixedSize(horizontal: false, vertical: true)
-                        .frame(maxWidth: .infinity, alignment: .topLeading)
+                    // STATIC MODE. Phase 7.7: wrap the Text in a
+                    // ScrollView so a long LLM response scrolls
+                    // inside the panel instead of growing it. The
+                    // Text keeps `fixedSize(horizontal: false,
+                    // vertical: true)` so it reports its natural
+                    // height and the ScrollView shows a vertical
+                    // scroller once that exceeds the visible area.
+                    // Tapping anywhere on the text enters edit mode
+                    // so the user can correct the transcript without
+                    // hunting for the ↲ button in the top bar.
+                    ScrollView {
+                        Text(viewModel.text.isEmpty ? "..." : viewModel.text)
+                            .font(.custom(settings.fontFamily, size: settings.fontSize))
+                            .foregroundColor(settings.theme.text)
+                            .multilineTextAlignment(.leading)
+                            .lineSpacing(settings.fontSize * (settings.lineSpacing - 1.0))
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .topLeading)
+                            .contentShape(Rectangle())
+                            .onTapGesture {
+                                toggleEdit()
+                            }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             }
             .padding(padding)
+            // Phase 7.7: make the inner VStack fill the ZStack so the
+            // Rectangle background (and the ScrollView / text field)
+            // extend to the panel's content edges, killing the gray
+            // blurred ring the NSVisualEffectView was showing where
+            // the SwiftUI view used to leave a gap.
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     /// 12pt strip at the very bottom. Houses the resize grip (Phase 7.5).
@@ -195,9 +279,17 @@ struct StickyNoteView: View {
     /// our NSPanel normally has `canBecomeKey == false` to avoid
     /// stealing focus, so we override that single time.
     private func toggleEdit() {
-        let willEdit = !viewModel.isEditing
-        viewModel.isEditing = willEdit
-        if willEdit {
+        if viewModel.isEditing {
+            // ✓ clicked: exit edit mode. If there's text, send it
+            // (the same path Enter takes).
+            viewModel.isEditing = false
+            if !viewModel.text.isEmpty {
+                onSend()
+            }
+        } else {
+            // ↲ clicked: enter edit mode + activate the panel so
+            // the text view becomes first responder.
+            viewModel.isEditing = true
             DispatchQueue.main.async {
                 NSApp.activate(ignoringOtherApps: true)
                 if let panel = NSApp.windows.first(where: { $0 is StickyNotePanel }) as? StickyNotePanel {
@@ -283,17 +375,39 @@ final class ResizeGripNSView: NSView {
 
     override func mouseDragged(with event: NSEvent) {
         guard let panel = window else { return }
+        // Flipped coords (AppKit y-up). The grip is at the bottom-right
+        // corner of the panel; we want the bottom-right corner to follow
+        // the cursor.
+        //   dx: drag *right* grows width — sign already correct.
+        //   dy: drag *down* should grow height, but in AppKit the
+        //       cursor's y *decreases* when going down — flip the sign
+        //       so drag-down → positive dy → larger height.
         let dx = event.locationInWindow.x - dragStart.x
-        let dy = event.locationInWindow.y - dragStart.y  // flipped coord: y up = positive
+        let dy = dragStart.y - event.locationInWindow.y
 
         let newW = max(minWidth, min(maxWidth, startSize.width + dx))
         let newH = max(minHeight, startSize.height + dy)
         let newSize = NSSize(width: newW, height: newH)
 
-        // Anchor the top-left; only bottom-right grows.
+        // Anchor the top-left: only the bottom-right corner follows
+        // the cursor. The panel's frame.origin is the bottom-left in
+        // AppKit, so to keep the top edge fixed when the height grows
+        // we have to push the origin *down* by the height delta.
+        // Without this, `setFrame` keeps the origin fixed and the
+        // panel grows upward — away from the cursor, which feels
+        // inverted (the "crece hacia arriba" bug).
         var newFrame = panel.frame
+        let heightDelta = newSize.height - newFrame.size.height
         newFrame.size = newSize
+        newFrame.origin.y -= heightDelta
         panel.setFrame(newFrame, display: true, animate: false)
+        // Force the content view (and its blur backdrop) to redraw.
+        // Without this, NSVisualEffectView's cached layer contents
+        // leave a "ghost" of the previous frame visible at the new
+        // bounds — especially noticeable at the edges where the
+        // panel grows. The setNeedsDisplay → display cascade
+        // refreshes the layer synchronously here.
+        panel.contentView?.needsDisplay = true
         onResize?(newSize)
     }
 

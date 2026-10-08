@@ -8,7 +8,12 @@ struct CursorPositioner {
     private let logger = Logger(subsystem: "com.salem.toicompanion", category: "CursorPositioner")
 
     /// Fixed size of the sticky note panel.
-    let panelWidth: CGFloat = 260
+    ///
+    /// `panelWidth` is locked to `StickyNoteView.minPanelWidth` (340).
+    /// If they're out of sync the SwiftUI body is wider than the NSPanel
+    /// and the right edge of the content (including the ↲ button in the
+    /// top bar) gets clipped by the panel's contentRect.
+    let panelWidth: CGFloat = 340
     let panelHeight: CGFloat = 140
 
     /// Horizontal offset from the cursor to the note's left edge.
