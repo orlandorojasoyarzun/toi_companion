@@ -299,16 +299,12 @@ final class ResizeGripNSView: NSView {
 
     override func resetCursorRects() {
         let r = NSRect(x: bounds.width - 16, y: 0, width: 16, height: 16)
-        // NSCursor has no `resizeUpRight` symbol — use the cross-version
-        // private selector path. AppKit exposes these as +[NSCursor _windowResizeUpRightCursor]
-        // in some SDKs, but the supported way is the bridged constant
-        // from the framework header. As a safe fallback we use the
-        // diagonal-resize cursor that has been available since 10.6.
-        if let cursor = NSCursor.value(forKey: "_windowResizeUpRightCursor") as? NSCursor {
-            addCursorRect(r, cursor: cursor)
-        } else {
-            addCursorRect(r, cursor: NSCursor.arrow)
-        }
+        // v2: KVC on NSCursor (`value(forKey: "_windowResizeUpRightCursor")`)
+        // crashes at runtime on macOS 15.5 with SIGTRAP — NSCursor is not
+        // KVC-compliant and the underscore-prefixed key trips
+        // `valueForUndefinedKey:`. Just use the arrow cursor; AppKit still
+        // handles the drag gesture correctly via mouseDown/Dragged below.
+        addCursorRect(r, cursor: NSCursor.arrow)
     }
 }
 
