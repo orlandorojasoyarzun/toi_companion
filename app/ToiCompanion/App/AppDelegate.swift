@@ -57,6 +57,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.sendCurrentTranscript(text)
         }
 
+        // Tell the panel how to find the menu bar icon so every
+        // `show()` anchors just below it. The closure reads the
+        // icon's current screen frame on each invocation — cheap,
+        // and stays correct if the system menu bar layout reflows
+        // (e.g. another app installs a status item). Returns nil
+        // only if the icon's window hasn't materialised yet, in
+        // which case the panel falls back to the cursor position.
+        StickyNotePanel.shared.menuBarFrameProvider = { [weak menu] in
+            guard let button = menu?.statusItem?.button,
+                  button.window != nil else { return nil }
+            return button.convert(button.bounds, to: nil)
+        }
+
         // Phase 2: request mic + speech recognition permission on first launch.
         Task { @MainActor in
             let result = await permissionGate.requestAllPermissions()
@@ -71,10 +84,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Phase 1+ friendly greeting: show the sticky note ~1.5s after
         // launch so the user can confirm the app is alive. Gated by
         // `hasInteracted` so a quick PTT press during this window doesn't
-        // get clobbered by the auto-hide.
+        // get clobbered by the auto-hide. The panel anchors below
+        // the menu bar icon (via `menuBarFrameProvider` set above),
+        // so the user sees it in a predictable spot — same place
+        // every show, even after dragging it elsewhere.
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
             guard !self.hasInteracted else { return }
-            StickyNotePanel.shared.show(initialText: "Greetings from Toi_Companion. Press right Shift▲ and ask me anything.")
+            StickyNotePanel.shared.show(
+                initialText: "Greetings from toitoi.dev: Use right Shift▲ and ask me anything."
+            )
             DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) {
                 guard !self.hasInteracted else { return }
                 StickyNotePanel.shared.scheduleHide()

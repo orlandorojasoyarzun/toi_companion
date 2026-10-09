@@ -7,7 +7,11 @@ import os.log
 final class MenuBarController {
 
     private let logger = AppLogger.make("MenuBar")
-    private var statusItem: NSStatusItem?
+    /// Exposed (read-only) so the AppDelegate can compute the
+    /// status-icon's screen frame when positioning the initial
+    /// greeting note "below the menu bar icon" (instead of at the
+    /// mouse cursor like the rest of the show() calls).
+    private(set) var statusItem: NSStatusItem?
 
     /// Set by AppDelegate. The menu calls into this to trigger test captures.
     weak var actions: MenuBarActions?

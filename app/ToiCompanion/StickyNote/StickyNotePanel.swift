@@ -15,9 +15,19 @@ final class StickyNotePanel: NSPanel {
 
     // MARK: - Panel behavior overrides
 
-    /// Never becomes key — does not steal focus from the target app.
-    override var canBecomeKey: Bool { false }
-    /// Never becomes main — does not activate the app.
+    /// Becomes key only while the user is editing the transcript.
+    /// The default `false` keeps the panel from stealing focus
+    /// during listening / streaming / response display, but
+    /// flipping to `true` when `isEditing` is on lets the
+    /// `NSTextView` inside the `WrappedTextField` actually
+    /// receive first responder — without this, the ↲ button
+    /// shows the field but no keystrokes land in it.
+    override var canBecomeKey: Bool { viewModel.isEditing }
+    /// Never becomes main — does not activate the app. We rely
+    /// on `NSApp.activate(ignoringOtherApps:)` being called
+    /// explicitly in `beginEditMode()` and `toggleEdit()`
+    /// instead, so the menu bar only updates when we actually
+    /// want it to.
     override var canBecomeMain: Bool { false }
 
     // MARK: - Animation constants
@@ -129,33 +139,49 @@ final class StickyNotePanel: NSPanel {
         hostingView.frame = NSRect(origin: .zero, size: hostingView.fittingSize)
         hostingView.autoresizingMask = [.width, .height]
 
-        // Add blur parent via NSVisualEffectView (stable across macOS versions).
-        let blurView = NSVisualEffectView(frame: NSRect(origin: .zero, size: hostingView.fittingSize))
-        blurView.autoresizingMask = [.width, .height]
-        blurView.blendingMode   = .behindWindow
-        blurView.material       = .popover
-        blurView.state          = .active
-        blurView.wantsLayer     = true
-        // DOS has sharp corners — no rounding, no clipping.
-        blurView.layer?.cornerRadius = 0
-        blurView.layer?.masksToBounds = true
-
-        blurView.addSubview(hostingView)
-
-        // Force the visual effect view to redraw its layer on every
-        // needsDisplay instead of caching a snapshot. Without this,
-        // fast panel resizes (via the bottom-right grip) leave a
-        // visible "ghost" of the previous frame because the cached
-        // layer contents don't keep up with the new bounds.
-        blurView.layerContentsRedrawPolicy = .onSetNeedsDisplay
-
-        // The panel itself has no background — the visual effect view provides the blur.
-        contentView = blurView
+        // Phase 7.8.2: the panel IS the sticky note — no
+        // NSVisualEffectView blur, no gray popover border, no
+        // `behindWindow` blending. The SwiftUI body's own
+        // `settings.theme.background` fill (on topBar / content /
+        // bottomGrip) provides the panel's appearance edge-to-edge.
+        //
+        // The earlier NSVisualEffectView(.popover) was the source
+        // of the "borde gris blur" the user kept seeing — when the
+        // panel's frame was set but the contentView's autoresizing
+        // hadn't caught up (or the hostingView's intrinsic content
+        // size was stale), the blur view extended past the SwiftUI
+        // body and the visible "leftover" area was a translucent
+        // gray rectangle. Removing the blur view entirely kills
+        // that class of glitch — the panel is now exactly the
+        // SwiftUI body, nothing more.
+        contentView = hostingView
     }
 
     // MARK: - Public API
 
-    /// Shows the sticky note at the cursor position with an optional initial text.
+    /// Optional closure that returns the menu bar status icon's
+    /// current frame in screen coordinates. Set by AppDelegate after
+    /// the MenuBarController is created. When set, every `show()`
+    /// anchors the panel just below the icon (its visual "home
+    /// base"). When nil, falls back to the cursor — useful for the
+    /// first few milliseconds of launch before the AppDelegate wires
+    /// things up.
+    ///
+    /// Why a closure and not a direct reference to the status item?
+    /// The icon's frame changes if the user opens the system menu
+    /// bar extras editor, or if the screen's status bar layout
+    /// reflows when other apps install status items. Reading the
+    /// frame on each `show()` keeps us current without subscribing
+    /// to layout notifications.
+    var menuBarFrameProvider: (() -> NSRect?)?
+
+    /// Shows the sticky note. By default the panel anchors **just
+    /// below the menu bar icon** (so the note always reappears in
+    /// the same predictable spot, even after the user dragged it
+    /// somewhere else and closed it). The drag-grip and top-bar
+    /// drag gesture still work, so the user can move it freely
+    /// within a session — the next `show()` simply resets it to
+    /// the default.
     func show(initialText: String = "...") {
         // Cancel any pending hide.
         hideTimer?.invalidate()
@@ -168,24 +194,94 @@ final class StickyNotePanel: NSPanel {
         // the carryover between shows.
         viewModel.userSize = nil
 
-        // Reposition near cursor.
-        let origin = cursorPositioner.computeOrigin()
-        setFrameOrigin(NSPoint(x: origin.x, y: origin.y))
-
-        // Fade in.
-        alphaValue = 0
-        orderFront(nil)
+        // Phase 7.8.2: set the text FIRST so the SwiftUI body has
+        // the new text in its view tree before we resize. The
+        // `@Published` assignment is synchronous, so by the time
+        // `setFrame` runs the body's `text` is "Listening ..." —
+        // even though the layer won't re-render until the next
+        // runloop tick, the `fittingSize` we read afterwards
+        // (if any) would already reflect the new content.
         viewModel.show(initialText: initialText)
-        // Phase 7.7: no resize on show. The panel's size is set in
-        // `init()` (greeting size) and only changes when the user
-        // drags the grip. LLM responses scroll inside the
-        // ScrollView instead of growing the panel. Calling
-        // `resizeToFit()` here would re-fit the panel on every
-        // show (the "re-arrange" glitch the user reported) and
-        // also leave a brief window where the NSVisualEffectView
-        // shows a stale blur of the old frame — the gray trail
-        // behind the note.
 
+        // Phase 7.8.1 (revisited): set the panel to the default
+        // size at the new origin *before* `orderFront`. This is
+        // the only way to guarantee the panel doesn't show up at
+        // the old 340×500 size from the previous LLM stream.
+        //
+        // Why not `resizeToFit()`? Because it reads
+        // `hostingView.fittingSize`, which is async — the
+        // NSHostingView's cached intrinsic content size is still
+        // from the previous stream at this point, so
+        // `resizeToFit()` would happily keep the panel at 500pt.
+        // The panel only snaps back to 140 when the first
+        // `updateText` from the STT triggers a second
+        // `resizeToFit` on the next runloop tick (the
+        // "se reecuadra" glitch).
+        //
+        // Why not `setFrame` alone? Earlier attempts with
+        // `display: false` and the old NSVisualEffectView caused
+        // the blur view to stay at the old size. Now the
+        // contentView IS the hostingView directly, so
+        // `setFrame` resizes the panel AND the contentView in one
+        // go (autoresizingMask cascade on the hostingView), and
+        // `display: true` forces the layer to commit.
+        //
+        // Anchor: prefer the menu bar icon's position (set via
+        // `menuBarFrameProvider` by AppDelegate) so every show
+        // reappears just below the icon — predictable spot, easy
+        // to find. Fall back to the cursor if the provider isn't
+        // wired yet (very early launch) or returns a degenerate
+        // frame.
+        let origin: CursorPositioner.Position
+        if let frame = menuBarFrameProvider?(),
+           frame.width > 0, frame.height > 0 {
+            origin = cursorPositioner.computeOriginBelowMenuBar(statusItemFrame: frame)
+        } else {
+            origin = cursorPositioner.computeOrigin()
+        }
+        let defaultFrame = NSRect(
+            x: origin.x,
+            y: origin.y,
+            width: cursorPositioner.panelWidth,
+            height: cursorPositioner.panelHeight
+        )
+        // Phase 7.8.3: force the panel through a hide → resize →
+        // show cycle. When the panel is already visible (e.g. the
+        // user presses shift while the note from the previous LLM
+        // response is still on screen), `setFrame` alone updates
+        // the window's frame but the contentView's autoresizingMask
+        // cascade is deferred to the next runloop tick — the panel
+        // shows up at the old 340×500 size and only snaps to 140
+        // when the first `updateText` triggers another
+        // `resizeToFit` (the "se reecuadra" glitch). Pulling the
+        // panel out of the window hierarchy first with `orderOut`
+        // ensures the resize is committed synchronously.
+        //
+        // `alphaValue = 0` is set *before* `orderOut` so the
+        // panel is already invisible when we yank it from the
+        // hierarchy — the user only sees the fade-in to the
+        // new size, not a flash of the old one.
+        alphaValue = 0
+        orderOut(nil)
+        setFrame(defaultFrame, display: true)
+        // Explicitly resize the hostingView as well. The
+        // contentView autoresizing cascade is supposed to handle
+        // this, but in practice when the panel was just yanked
+        // out of the window hierarchy the hostingView's frame
+        // can lag the window's contentRect. Setting the frame
+        // here keeps both in lockstep before we re-show.
+        if let hostingView = contentView as? NSHostingView<StickyNoteView> {
+            hostingView.frame = NSRect(origin: .zero, size: defaultFrame.size)
+            hostingView.layoutSubtreeIfNeeded()
+        }
+        orderFront(nil)
+
+        // Fade in. `alphaValue = 0` was already set above (before
+        // `orderOut`) so the panel was invisible during the
+        // hide/resize/show cycle. The fade-in here is what reveals
+        // it at the new default size — the SwiftUI body has had
+        // the runloop tick it needed to re-render with
+        // "Listening ...".
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = fadeInDuration
             ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
@@ -220,7 +316,42 @@ final class StickyNotePanel: NSPanel {
         DispatchQueue.main.async {
             NSApp.activate(ignoringOtherApps: true)
             self.makeKeyAndOrderFront(nil)
+            // The SwiftUI body needs a runloop tick to swap from the
+            // static `Text` to the `WrappedTextField` (which lazily
+            // creates the NSTextView in `makeNSView`). One more async
+            // hop waits for that re-render before we look for the
+            // text view in the view hierarchy. Without this, the
+            // first attempt finds nothing — the text view doesn't
+            // exist yet — and the user has to click the field
+            // manually to start typing.
+            DispatchQueue.main.async {
+                self.focusFirstTextView()
+            }
         }
+    }
+
+    /// Walk the view hierarchy and make the first NSTextView the
+    /// first responder. Called from `beginEditMode()` and from the
+    /// ↲ button's flow in `StickyNoteView.toggleEdit()` so the
+    /// user can type immediately after the panel flips to edit
+    /// mode. Returns silently if no NSTextView is found yet (the
+    /// SwiftUI body may still be mid-render — caller can retry
+    /// from the next runloop tick).
+    func focusFirstTextView() {
+        guard let textView = findTextView(in: contentView) else { return }
+        makeFirstResponder(textView)
+    }
+
+    /// Recursive first-NSTextView search. The NSTextView lives two
+    /// levels deep (NSHostingView > NSScrollView > NSTextView) so a
+    /// fixed-depth lookup would be brittle — walk the tree instead.
+    private func findTextView(in view: NSView?) -> NSTextView? {
+        guard let view = view else { return nil }
+        if let textView = view as? NSTextView { return textView }
+        for subview in view.subviews {
+            if let textView = findTextView(in: subview) { return textView }
+        }
+        return nil
     }
 
     /// Mark the start/end of an LLM stream. The panel is fixed-size
@@ -295,7 +426,10 @@ final class StickyNotePanel: NSPanel {
 /// this hid the streaming text and didn't "invite" them to open the
 /// note — they want the note to visibly grow as the LLM types.
 private func resizeToFit() {
-    guard let hostingView = contentView?.subviews.first as? NSHostingView<StickyNoteView> else { return }
+    // Phase 7.8.2: the hostingView IS the contentView now (no
+    // more NSVisualEffectView wrapper), so cast directly instead
+    // of going through `subviews.first`.
+    guard let hostingView = contentView as? NSHostingView<StickyNoteView> else { return }
 
     // Save the current panel size back into the view model so the
     // resize grip can read it on the next drag.
