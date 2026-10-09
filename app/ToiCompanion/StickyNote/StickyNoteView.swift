@@ -43,10 +43,27 @@ struct StickyNoteView: View {
     /// top bar) gets clipped by the panel's contentRect — the "buttons
     /// covered" bug.
     private let minPanelWidth: CGFloat = 340
-    private let maxPanelWidth: CGFloat = 420
+    /// Upper bound for user drag-resize. Was 420 (just a "comfortable
+    /// reading width") but that clipped the right edge as soon as the
+    /// user tried to make a wider note — a native Mac window has no
+    /// arbitrary upper limit, so we let it go up to roughly a
+    /// half-screen-width instead. The actual hard cap is the screen
+    /// visible frame, applied inside `ResizeGripNSView.mouseDragged`.
+    private let maxPanelWidth: CGFloat = 800
     /// Floor for the panel's height. Matches `StickyNotePanel.minPanelHeight`
     /// so an empty / very-short note still reads as a deliberate note.
     private let minPanelHeight: CGFloat = 140
+    /// Upper bound for user drag-resize on the height axis. Computed
+    /// from the screen's visible frame at init (minus a small margin)
+    /// so the note can grow down to almost the bottom of the display
+    /// but never past it — same behaviour as a Finder window dragged
+    /// to the bottom edge.
+    private let maxPanelHeight: CGFloat = {
+        if let screen = NSScreen.main {
+            return screen.visibleFrame.height - 40
+        }
+        return 600
+    }()
 
     /// Height of the top control bar. Kept in sync with the parent's
     /// `mouseDown` check so clicks in this band start a window drag
@@ -119,14 +136,36 @@ struct StickyNoteView: View {
                 Image(systemName: "xmark")
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundColor(settings.theme.text.opacity(0.7))
-                    .frame(width: 22, height: Self.topBarHeight)
+                    // Frame is now 16×16 (was 22×24). The previous
+                    // wider-than-tall frame put the SF Symbol's
+                    // bounding box in a strip where the visible
+                    // glyph rendered closer to the bottom of the
+                    // box (SF Symbols' intrinsic baseline leaves
+                    // more headroom than footroom) — the X looked
+                    // "pegado abajo" even though the bounding box
+                    // was centred. A square 16×16 frame + the same
+                    // outer padding 6 keeps the click area
+                    // generous while letting the icon sit visually
+                    // centred both axes.
+                    .frame(width: 16, height: 16)
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            // Bumped from 6 → 10 so the X has a bit more breathing room
-            // from the panel's left edge. At 260 pt the 6 pt padding put
-            // the icon visually flush with the corner.
-            .padding(.leading, 10)
+            // SF Symbol "xmark" / "return" / "checkmark" glyphs
+            // render visually above their bounding-box centre — the
+            // shape of the strokes puts the optical weight near the
+            // top of the cap-height line. So even with a 16×16 frame
+            // centred in a 24-pt top bar, the icons read as "pegado
+            // al borde superior". A +2 pt offset compensates and
+            // brings the visible glyph into the vertical middle.
+            .offset(y: 2)
+            // Outer padding 3 + 16-wide frame + 3-pt inner-to-glyph
+            // ≈ 6 pt horizontal — matches the ~6 pt of vertical
+            // space above the offset icon, so the button reads as
+            // "proportionally padded" on all four sides instead of
+            // "wide strip with a tiny icon". Was 6 → 10 before the
+            // 22×24→16×16 frame change.
+            .padding(.leading, 3)
 
             Spacer()
 
@@ -139,13 +178,23 @@ struct StickyNoteView: View {
                 Image(systemName: viewModel.isEditing ? "checkmark" : "return")
                     .font(.system(size: 11, weight: .regular))
                     .foregroundColor(settings.theme.text.opacity(0.7))
-                    .frame(width: 22, height: Self.topBarHeight)
+                    // Same 16×16 square frame as the X (was 22×24) for
+                    // the same reason: SF Symbol glyphs render visually
+                    // off-centre in a tall frame, so a square frame
+                    // keeps both icons visually balanced.
+                    .frame(width: 16, height: 16)
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            // Bumped from 8 → 12 (mirror of the X's 10) so both buttons
-            // sit comfortably inside the panel.
-            .padding(.trailing, 12)
+            // Same +2 pt downward offset as the X (see comment on
+            // the X button above). Keeps both icons visually
+            // balanced inside the 24-pt top bar.
+            .offset(y: 2)
+            // Trailing 5 (mirror of the X's leading 3, keeping the
+            // 2 pt asymmetry so the ↲ visually mirrors the X —
+            // ↲ side: 5 + 2.5 = 7.5 pt, X side: 3 + 3 = 6 pt, both
+            // close to the ~6 pt vertical).
+            .padding(.trailing, 5)
         }
         .frame(height: Self.topBarHeight)
         .background(
@@ -261,6 +310,8 @@ struct StickyNoteView: View {
             minWidth: minPanelWidth,
             maxWidth: maxPanelWidth,
             minHeight: minPanelHeight,
+            maxHeight: maxPanelHeight,
+            textColor: settings.theme.text,
             onResize: { newSize in
                 viewModel.userSize = newSize
             }
@@ -277,7 +328,12 @@ struct StickyNoteView: View {
     /// Flip the `isEditing` flag. When entering edit, force a window
     /// become-key so the NSTextView can actually receive text input —
     /// our NSPanel normally has `canBecomeKey == false` to avoid
-    /// stealing focus, so we override that single time.
+    /// stealing focus, but `StickyNotePanel.canBecomeKey` is now
+    /// `viewModel.isEditing`, so flipping the flag is what unlocks
+    /// `makeKeyAndOrderFront`. After the SwiftUI body re-renders
+    /// (one more runloop tick) we call `panel.focusFirstTextView()`
+    /// to drop the caret into the field so the user can type
+    /// immediately.
     private func toggleEdit() {
         if viewModel.isEditing {
             // ✓ clicked: exit edit mode. If there's text, send it
@@ -294,6 +350,11 @@ struct StickyNoteView: View {
                 NSApp.activate(ignoringOtherApps: true)
                 if let panel = NSApp.windows.first(where: { $0 is StickyNotePanel }) as? StickyNotePanel {
                     panel.makeKeyAndOrderFront(nil)
+                    // Wait for SwiftUI to swap in the WrappedTextField,
+                    // then make its NSTextView first responder.
+                    DispatchQueue.main.async {
+                        panel.focusFirstTextView()
+                    }
                 }
             }
         }
@@ -302,14 +363,23 @@ struct StickyNoteView: View {
 
 // MARK: - Resize grip
 
-/// Bottom-right resize grip. The visible part is just six short diagonal
-/// strokes in the theme's text colour at 50% opacity. Mouse drag updates
-/// the panel's frame via the `onResize` callback.
+/// Bottom-right resize grip. The visible part is just two short diagonal
+/// strokes in the theme's text colour at low opacity so they read as
+/// a subtle "this is draggable" affordance without competing with the
+/// body text. Mouse drag updates the panel's frame via the `onResize`
+/// callback.
 struct ResizeGripView: NSViewRepresentable {
     var currentSize: CGSize
     var minWidth: CGFloat
     var maxWidth: CGFloat
     var minHeight: CGFloat
+    var maxHeight: CGFloat
+    /// The theme's foreground colour, used as the grip stroke colour
+    /// so the lines are visible on every background — white on the
+    /// DOS-blue and Helix-purple themes, black on the taxi-yellow
+    /// theme. Was hardcoded to white (1.0) which disappeared on
+    /// yellow.
+    var textColor: Color
     var onResize: (CGSize) -> Void
 
     func makeNSView(context: Context) -> ResizeGripNSView {
@@ -318,6 +388,8 @@ struct ResizeGripView: NSViewRepresentable {
         v.minWidth = minWidth
         v.maxWidth = maxWidth
         v.minHeight = minHeight
+        v.maxHeight = maxHeight
+        v.gripColor = NSColor(textColor)
         return v
     }
 
@@ -326,6 +398,8 @@ struct ResizeGripView: NSViewRepresentable {
         nsView.minWidth = minWidth
         nsView.maxWidth = maxWidth
         nsView.minHeight = minHeight
+        nsView.maxHeight = maxHeight
+        nsView.gripColor = NSColor(textColor)
         nsView.needsDisplay = true
     }
 }
@@ -337,6 +411,13 @@ final class ResizeGripNSView: NSView {
     var minWidth: CGFloat = 280
     var maxWidth: CGFloat = 380
     var minHeight: CGFloat = 140
+    var maxHeight: CGFloat = 600
+    /// Stroke colour for the diagonal grip lines. Fed by the
+    /// SwiftUI host's theme so the lines stay visible on every
+    /// background (white on blue/purple, black on yellow). The
+    /// `draw` method applies the 40% alpha on top of this base
+    /// colour to keep the grip subtle.
+    var gripColor: NSColor = NSColor(white: 1.0, alpha: 1.0)
 
     private var dragStart: NSPoint = .zero
     private var startSize: NSSize = .zero
@@ -346,18 +427,28 @@ final class ResizeGripNSView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
 
-        // Draw 3 short diagonal lines in the bottom-right corner.
-        let lineColor = NSColor(white: 1.0, alpha: 0.4).cgColor
+        // Draw 2 short diagonal lines in the bottom-right corner.
+        // (Was 3; the user trimmed the third because three read as
+        // "stack of lines" rather than "grip indicator" inside the
+        // 12-pt strip.)
+        //
+        // The stroke colour comes from the theme's `text` colour
+        // (passed in by the SwiftUI host as `gripColor`) so the
+        // lines are visible on every background — white on the
+        // blue and purple themes, black on the yellow theme.
+        // Previously hardcoded to NSColor(white: 1.0, ...) which
+        // was invisible on the yellow background.
+        let strokeColor = gripColor.withAlphaComponent(0.4).cgColor
         let lineWidth: CGFloat = 1.0
         let length: CGFloat = 5.0
         let gap: CGFloat = 3.0
         let inset: CGFloat = 2.0
 
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
-        ctx.setStrokeColor(lineColor)
+        ctx.setStrokeColor(strokeColor)
         ctx.setLineWidth(lineWidth)
 
-        for i in 0..<3 {
+        for i in 0..<2 {
             let x = bounds.width - inset - length - CGFloat(i) * gap
             let y = inset + CGFloat(i) * gap
             ctx.move(to: CGPoint(x: x, y: y))
@@ -386,7 +477,7 @@ final class ResizeGripNSView: NSView {
         let dy = dragStart.y - event.locationInWindow.y
 
         let newW = max(minWidth, min(maxWidth, startSize.width + dx))
-        let newH = max(minHeight, startSize.height + dy)
+        let newH = max(minHeight, min(maxHeight, startSize.height + dy))
         let newSize = NSSize(width: newW, height: newH)
 
         // Anchor the top-left: only the bottom-right corner follows
@@ -401,13 +492,14 @@ final class ResizeGripNSView: NSView {
         newFrame.size = newSize
         newFrame.origin.y -= heightDelta
         panel.setFrame(newFrame, display: true, animate: false)
-        // Force the content view (and its blur backdrop) to redraw.
-        // Without this, NSVisualEffectView's cached layer contents
-        // leave a "ghost" of the previous frame visible at the new
-        // bounds — especially noticeable at the edges where the
-        // panel grows. The setNeedsDisplay → display cascade
-        // refreshes the layer synchronously here.
-        panel.contentView?.needsDisplay = true
+        // Force the content view to lay out synchronously. Without
+        // this the SwiftUI body's re-render lags the AppKit
+        // setFrame by a runloop tick and the bottom edge of the
+        // panel shows the previous frame's content (the
+        // "hacia abajo se glichea" jitter). layoutSubtreeIfNeeded
+        // commits the hostingView's autoresizing cascade right now
+        // so the panel's visible bounds match its frame immediately.
+        panel.contentView?.layoutSubtreeIfNeeded()
         onResize?(newSize)
     }
 
